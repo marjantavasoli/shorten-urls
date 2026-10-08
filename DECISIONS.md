@@ -10,7 +10,7 @@ None. Part 1 uses only the Go standard library (`net/http`, `encoding/json`,
 ### Package layout
 
 ```text
-cmd/server/            main: flags (-addr, -base), validation, wiring, http.Server.
+cmd/server/            main: flags (-addr, -base, -max-links), validation, wiring, http.Server.
                        Logic lives in run()/parseConfig() so it is testable; main() only calls run().
 internal/shortener/    Domain, no HTTP or storage knowledge: Link type, NormalizeURL,
                        RandomCode, IsValidCode, sentinel errors (Part 2).
@@ -143,7 +143,7 @@ concurrent duplicate shortens converge on one code
 (`TestShorten_ConcurrentSameURL`, 200 goroutines released at once; also over
 HTTP in `TestConcurrentShortenSameURLAndRedirect`).
 
-Part 3 benchmarks will confirm or revisit this choice.
+Part 3 measured this choice; the `RWMutex` stays (see Part 3, "Locking choice").
 
 ### HTTP details
 
@@ -207,9 +207,11 @@ type Store interface {
 - **Location:** at the consumer, following "accept interfaces, return
   structs". `memory.Store` satisfies it without importing `httpapi`. The
   interface lists only the two methods the handlers call (`Len()` stays on
-  `memory.Store` as a test helper). `cmd/server` has a compile-time check,
-  `var _ httpapi.Store = (*memory.Store)(nil)`, and is the only place a
-  concrete store is chosen.
+  `memory.Store` as a test helper). `cmd/server` is the only place a
+  concrete store is chosen. Passing `memory.New()` to `httpapi.New`, which
+  takes a `Store`, is itself the compile-time check that the memory store
+  satisfies the interface, so no separate `var _ httpapi.Store = …`
+  assertion is kept.
 - **`Shorten(longURL)`** expects an already-normalized URL and returns the
   existing link or creates one. Same URL → same code: the Part 1
   idempotency rule is part of the interface contract, not just a property
@@ -233,6 +235,7 @@ sentinel however many times the error has been wrapped with `%w`.
 |---|---|---|
 | wraps `ErrInvalidURL` | 400 | `{"error":"invalid url: <reason>"}`: the reason is safe and helps the client fix the request |
 | wraps `ErrNotFound` | 404 | `{"error":"not found"}` |
+| wraps `ErrStoreFull` (added in Part 3) | 507 | `{"error":"link storage is full"}` |
 | anything else | 500 | `{"error":"internal error"}`: details are logged on the server and never sent to the client |
 
 Request-format errors are found while decoding the body, before any domain
@@ -241,7 +244,8 @@ call, and return 400 directly:
 - trailing data after the JSON object
 - a body larger than 8 KiB
 
-Wrong methods get 405 from `ServeMux`.
+A body that does not arrive before `ReadTimeout` returns **408** (added in
+Part 3). Wrong methods get 405 from `ServeMux`.
 
 The 500 body is deliberately generic. A store error may contain hostnames,
 SQL or file paths (Part 4), and the client can't act on any of that.
@@ -282,3 +286,150 @@ SQL or file paths (Part 4), and the client can't act on any of that.
   (`TestShorten_Idempotent`, `TestConcurrentShortenSameURLAndRedirect`) now
   run through the `Store` interface, because `httpapi.New` takes a `Store`.
   The memory store's idempotency and concurrency tests are unchanged.
+
+## Part 3
+
+Numbers below come from Go 1.24.7, linux/amd64, on an Intel Xeon @ 2.10GHz
+with **2 vCPUs**. They are relative measurements on one machine, not
+production capacity.
+
+### Locking choice: `sync.RWMutex` (kept, now measured)
+
+Part 1 chose `RWMutex` because redirects should far outnumber creates. Part 3
+checks that with `BenchmarkLock_ReadHeavy`
+(`internal/store/memory/store_bench_test.go`):
+- the store's access pattern in isolation: a `map[string]Link` with 100k entries;
+- 99% reads and 1% inserts;
+- run with `b.RunParallel`;
+- the same code with each lock type.
+
+A small adapter makes a plain `Mutex` satisfy the same `Lock/RLock`
+interface, so both variants pay the same interface-call cost and differ only
+in the lock.
+
+`go test -run "^$" -bench Lock_ReadHeavy -cpu 1,4,8 -count 3 ./internal/store/memory/`
+(medians, ns/op, lower is better):
+
+| goroutines (`-cpu`) | `Mutex` | `RWMutex` | |
+|---|---|---|---|
+| 1 | 54.6 | 56.4 | tie (within noise) |
+| 4 | 99.0 | 66.6 | `RWMutex` ~33% faster |
+| 8 | 116.6 | 71.4 | `RWMutex` ~39% faster |
+
+With one goroutine there is no contention, so the two locks cost the same.
+As soon as several goroutines read at once, `Mutex` serializes the readers,
+while `RWMutex` lets them proceed together. The gap grows with concurrency,
+and a server handling many redirects is exactly that case. **Decision: keep
+`RWMutex`.** The lock table from Part 1 (which methods take `RLock` vs
+`Lock`) is unchanged.
+
+Caveat: with 2 vCPUs, `-cpu 4,8` means more goroutines than cores. That
+measures contention, not true 8-core parallelism. The direction of the
+result is the standard one for read-heavy maps; on more cores the gap is
+expected to stay or widen.
+
+The production store does not use the adapter. It keeps a concrete
+`sync.RWMutex` field, so the hot path has no interface-call overhead. The
+comparison lives only in the benchmark file. That was a deliberate change
+from my first plan, which would have made the store's lock pluggable.
+
+### Timeout values and slow-client behavior
+
+Set on `http.Server` in `cmd/server` (`newServer`). They are fields on the
+`config` struct with defaults in `defaultConfig()`, **not CLI flags**, so
+tests can shorten them while operators get one sensible set:
+
+| Field | Value | Why this value |
+|---|---|---|
+| `ReadHeaderTimeout` | 5s | Headers are a few hundred bytes; any real client sends them in well under a second |
+| `ReadTimeout` | 10s | Covers headers plus a body of at most 8 KiB, even on a poor mobile link |
+| `WriteTimeout` | 10s | Responses are under 200 bytes |
+| `IdleTimeout` | 60s | Keep-alive reuse for normal browsing, without holding idle sockets forever |
+| `MaxHeaderBytes` | 16 KiB | The default is 1 MiB; this API needs a fraction of that |
+
+What a slow or misbehaving client experiences:
+
+| Client behavior | Result | Tested by |
+|---|---|---|
+| Sends headers byte by byte (slowloris) | Connection closed after 5s with no response, since no request was ever parsed. Frees the goroutine and socket | `TestServer_SlowHeadersAreCutOff` (real TCP socket, timeouts shortened to ~150 ms) |
+| Sends headers, then the body too slowly | **408** `{"error":"request body was not received in time"}`. The handler detects a `net.Error` with `Timeout()` from the body read; without this check, the timeout would have been reported as a misleading 400 "must be a JSON object" | `TestServer_SlowBodyGets408` (real socket), `TestShorten_BodyReadTimeoutIs408` (unit) |
+| Stops reading the response | The write fails after 10s and the connection is closed | (standard library behavior) |
+| Keeps an idle keep-alive connection | Closed after 60s | (standard library behavior) |
+
+`http.TimeoutHandler` is not used. Our handlers do no slow work: they spend
+microseconds in a map. Slow server-side work arrives with Postgres in Part 4
+and will be bounded through `context` deadlines on the queries.
+
+### Eviction cap: cap without eviction (`-max-links`, default 1,000,000)
+
+- **Measured cost per link: about 253 bytes of heap**
+  (`BenchmarkMemoryPerLink`: 100k links with ~80-character URLs, heap
+  measured after `runtime.GC()`). This covers both maps, the `Link` value,
+  the code string, the URL string (shared between `byURL`'s key and
+  `Link.URL`) and map overhead. Longer URLs cost more, roughly one byte per
+  extra character.
+- **Default cap 1,000,000 ≈ 250 MB of live heap.** With Go's default
+  `GOGC=100`, peak heap can reach about twice the live heap, so roughly
+  500 MB. That is a safe ceiling for a small VM or container.
+  `-max-links 0` disables the cap.
+- **When full:**
+  - **existing** URLs still return **201** with their code, because the
+    idempotent fast path is checked before the cap;
+  - redirects and metadata keep working;
+  - only **new** URLs are rejected, with **507 Insufficient Storage**
+    `{"error":"link storage is full"}` (`shortener.ErrStoreFull`, mapped in
+    `writeDomainError`).
+- **Why no eviction:** evicting a link means a short URL someone already
+  shared starts returning 404. For a URL shortener that is a correctness
+  bug, not a cache miss. Refusing new links is visible and recoverable;
+  silently breaking old ones is neither.
+- **The check is atomic:** it runs under the same write lock as the insert,
+  so concurrent creates can never overshoot the cap
+  (`TestShorten_ConcurrentAtCapacity`: 100 goroutines, cap 10 → exactly 10
+  links).
+- **The cap also bounds GC cost.** Profiling (below) shows that GC marking
+  is the largest CPU cost on the create path, and it grows with the number
+  of stored links.
+- In Part 4, the durable Postgres store has no in-process cap; database
+  capacity is managed separately.
+
+### Benchmarks
+
+| Package | Benchmark | What it isolates |
+|---|---|---|
+| `memory` | `Shorten_New`, `Shorten_Existing` | Create path (code generation + write lock) vs idempotent fast path (read lock) |
+| `memory` | `Get`, `Get_Parallel`, `Mixed_Parallel` | Redirect lookup alone, under contention, and with a realistic 99:1 read/write mix |
+| `memory` | `Lock_ReadHeavy/{Mutex,RWMutex}`, `MemoryPerLink` | The locking decision and the eviction-cap sizing above |
+| `httpapi` | `HTTP_Shorten_New`, `HTTP_Shorten_Existing`, `HTTP_Redirect`, `HTTP_Metadata` | Full handler path via `ServeHTTP` (routing, JSON, store), without TCP |
+| `shortener` | `RandomCode`, `NormalizeURL`, `IsValidCode` | Building blocks of the create and redirect paths |
+
+All use `b.ReportAllocs()` and the classic `for i := 0; i < b.N; i++` loop,
+because `b.Loop()` needs Go 1.24 and the module declares 1.22.
+
+### Profiling insight
+
+The README shows the commands and the main finding. In short:
+
+- **GC is the largest single cost on the create path.** About 30% of CPU
+  samples are background GC marking (`runtime.gcBgMarkWorker` →
+  `scanobject`), and allocation itself (`runtime.mallocgc`) adds about 21%.
+  Both are more than any single function of our own. The store keeps every link, and every link holds
+  pointers (strings), so each GC cycle must scan the whole store. That cost
+  grows with the number of links, which is another reason for the cap.
+- **Of our own code:**
+  - `store.Shorten` ≈ 17% of samples, about half of it `crypto/rand.Int`;
+  - JSON decoding ≈ 12%;
+  - JSON encoding of the response ≈ 10%.
+
+  `RandomCode` costs ~1 µs and 20 allocations per 6-character code, because
+  `rand.Int` allocates `big.Int` values for every character. That is the
+  price of the simpler implementation chosen in Part 1. It only affects
+  creates, which are rare compared with redirects, so it is left as is.
+  Filling a byte buffer with a single `rand.Read` would cut it to about one
+  allocation if creates ever become hot.
+- **The redirect path is cheap:** about 1 µs end to end through
+  `ServeHTTP`, with a 0-allocation, ~60 ns store lookup.
+- **Harness overhead:** the B/op of the HTTP benchmarks is inflated by
+  `httptest.NewRequest`, which allocates a 4 KiB `bufio.Reader` per request
+  (51% of allocated bytes in the memory profile). That is test scaffolding,
+  not server cost; a real `http.Server` reuses per-connection buffers.

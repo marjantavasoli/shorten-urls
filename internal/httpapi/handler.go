@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -61,6 +62,11 @@ func (h *Handler) shorten(w http.ResponseWriter, r *http.Request) {
 
 	var req shortenRequest
 	if err := dec.Decode(&req); err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			writeError(w, http.StatusRequestTimeout, "request body was not received in time")
+			return
+		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeError(w, http.StatusBadRequest, "request body too large")
@@ -129,6 +135,9 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, shortener.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, shortener.ErrStoreFull):
+		log.Printf("store full: %v", err)
+		writeError(w, http.StatusInsufficientStorage, "link storage is full")
 	default:
 		log.Printf("internal error: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -144,5 +145,45 @@ func TestRedirectAndMetadata_WithFake(t *testing.T) {
 
 	if rec := doGet(h, "/api/v1/links/zzzzzz"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown code: status %d, want 404", rec.Code)
+	}
+}
+
+func TestWriteDomainError_StoreFull(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeDomainError(rec, fmt.Errorf("shorten: %w", shortener.ErrStoreFull))
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Errorf("status = %d, want 507", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "link storage is full") {
+		t.Errorf("body = %s", rec.Body)
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+type slowBody struct{ sent bool }
+
+func (b *slowBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, `{"url":`), nil
+	}
+	return 0, &net.OpError{Op: "read", Net: "tcp", Err: timeoutErr{}}
+}
+
+func TestShorten_BodyReadTimeoutIs408(t *testing.T) {
+	fs := &fakeStore{}
+	req := httptest.NewRequest(http.MethodPost, "/api/shorten", &slowBody{})
+	rec := httptest.NewRecorder()
+	New(fs, testBase).ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestTimeout {
+		t.Errorf("status = %d, want 408; body %s", rec.Code, rec.Body)
+	}
+	if calls, _ := fs.calls(); len(calls) != 0 {
+		t.Error("store called after body timeout")
 	}
 }

@@ -20,13 +20,16 @@ func WithCodeFunc(f CodeFunc) Option { return func(s *Store) { s.newCode = f } }
 
 func WithClock(now func() time.Time) Option { return func(s *Store) { s.now = now } }
 
+func WithMaxLinks(n int) Option { return func(s *Store) { s.maxLinks = n } }
+
 type Store struct {
 	mu     sync.RWMutex
 	byCode map[string]shortener.Link
 	byURL  map[string]string
 
-	newCode CodeFunc
-	now     func() time.Time
+	newCode  CodeFunc
+	now      func() time.Time
+	maxLinks int
 }
 
 func New(opts ...Option) *Store {
@@ -59,6 +62,10 @@ func (s *Store) Shorten(longURL string) (shortener.Link, error) {
 				l := s.byCode[existing]
 				s.mu.Unlock()
 				return l, nil
+			}
+			if s.maxLinks > 0 && len(s.byCode) >= s.maxLinks {
+				s.mu.Unlock()
+				return shortener.Link{}, fmt.Errorf("%d links stored: %w", s.maxLinks, shortener.ErrStoreFull)
 			}
 			if _, taken := s.byCode[code]; taken {
 				s.mu.Unlock()

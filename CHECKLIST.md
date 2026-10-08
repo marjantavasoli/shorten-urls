@@ -27,13 +27,13 @@
 
 ## Part 3 — Performance & measurement (25 points)
 
-| Done | Pts | Requirement |
-|:----:|:---:|-------------|
-| [ ] | 5 | Server timeouts configured |
-| [ ] | 5 | `Mutex` vs `RWMutex` matches behavior and `DECISIONS.md` |
-| [ ] | 5 | Benchmarks for shorten and redirect |
-| [ ] | 5 | README: benchmark line + profiling insight |
-| [ ] | 5 | Tests and `-race` still green |
+| Done | Pts | Requirement | Where |
+|:----:|:---:|-------------|-------|
+| [x] | 5 | Server timeouts configured | `cmd/server.newServer`; `TestNewServer_Timeouts`, `TestServer_SlowHeadersAreCutOff`, `TestServer_SlowBodyGets408` |
+| [x] | 5 | `Mutex` vs `RWMutex` matches behavior and `DECISIONS.md` | `RWMutex` in `memory.Store`; measured by `BenchmarkLock_ReadHeavy`; DECISIONS → Part 3 |
+| [x] | 5 | Benchmarks for shorten and redirect | `memory/store_bench_test.go`, `httpapi/handler_bench_test.go`, `shortener/bench_test.go` |
+| [x] | 5 | README: benchmark line + profiling insight | README → Performance |
+| [x] | 5 | Tests and `-race` still green | `go test -race ./...` |
 
 ## Part 4 — Persistence (25 points)
 

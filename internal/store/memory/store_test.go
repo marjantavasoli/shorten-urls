@@ -207,3 +207,59 @@ func TestShorten_ConcurrentDistinctURLsAndReads(t *testing.T) {
 		t.Errorf("Len = %d, want %d", s.Len(), n)
 	}
 }
+
+func TestShorten_MaxLinks(t *testing.T) {
+	s := New(WithMaxLinks(2))
+	a, err := s.Shorten("https://example.com/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Shorten("https://example.com/b"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.Shorten("https://example.com/c")
+	if !errors.Is(err, shortener.ErrStoreFull) {
+		t.Fatalf("third URL: err = %v, want ErrStoreFull", err)
+	}
+	if s.Len() != 2 {
+		t.Errorf("Len = %d, want 2", s.Len())
+	}
+
+	again, err := s.Shorten("https://example.com/a")
+	if err != nil || again != a {
+		t.Errorf("existing URL when full = %+v, %v; want %+v, nil", again, err, a)
+	}
+	if got, err := s.Get(a.Code); err != nil || got != a {
+		t.Errorf("Get when full = %+v, %v", got, err)
+	}
+}
+
+func TestShorten_ZeroMaxLinksIsUnlimited(t *testing.T) {
+	s := New(WithMaxLinks(0))
+	for i := range 50 {
+		if _, err := s.Shorten(fmt.Sprintf("https://example.com/%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestShorten_ConcurrentAtCapacity(t *testing.T) {
+	const capacity = 10
+	s := New(WithMaxLinks(capacity))
+	var wg sync.WaitGroup
+	for i := range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.Shorten(fmt.Sprintf("https://example.com/%d", i))
+			if err != nil && !errors.Is(err, shortener.ErrStoreFull) {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if s.Len() != capacity {
+		t.Errorf("Len = %d, want exactly %d", s.Len(), capacity)
+	}
+}
