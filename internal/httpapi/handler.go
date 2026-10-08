@@ -3,30 +3,32 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"url-shortener/internal/shortener"
-	"url-shortener/internal/store/memory"
 )
 
 const maxBodyBytes = 8 << 10
 
 type Handler struct {
-	store   *memory.Store
+	store   Store
 	baseURL string
 	mux     *http.ServeMux
 }
 
-func New(store *memory.Store, baseURL string) *Handler {
+func New(store Store, baseURL string) *Handler {
 	h := &Handler{
 		store:   store,
 		baseURL: strings.TrimRight(baseURL, "/"),
 		mux:     http.NewServeMux(),
 	}
 	h.mux.HandleFunc("POST /api/shorten", h.shorten)
+	h.mux.HandleFunc("GET /api/v1/links/{code}", h.metadata)
 	h.mux.HandleFunc("GET /{code}", h.redirect)
 	return h
 }
@@ -42,6 +44,11 @@ type shortenRequest struct {
 type shortenResponse struct {
 	Code     string `json:"code"`
 	ShortURL string `json:"short_url"`
+}
+
+type linkResponse struct {
+	URL       string `json:"url"`
+	CreatedAt string `json:"created_at"`
 }
 
 type errorResponse struct {
@@ -69,14 +76,13 @@ func (h *Handler) shorten(w http.ResponseWriter, r *http.Request) {
 
 	longURL, err := shortener.NormalizeURL(req.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid url: "+err.Error())
+		writeDomainError(w, err)
 		return
 	}
 
 	link, err := h.store.Shorten(longURL)
 	if err != nil {
-		log.Printf("shorten: %v", err)
-		writeError(w, http.StatusInternalServerError, "could not create short link")
+		writeDomainError(w, fmt.Errorf("shorten: %w", err))
 		return
 	}
 
@@ -87,20 +93,46 @@ func (h *Handler) shorten(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
-	code := r.PathValue("code")
-	if !shortener.IsValidCode(code) {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	link, ok := h.store.Get(code)
-	if !ok {
-		writeError(w, http.StatusNotFound, "not found")
+	link, err := h.lookup(r.PathValue("code"))
+	if err != nil {
+		writeDomainError(w, err)
 		return
 	}
 	// Set Location directly instead of http.Redirect, which may rewrite the
 	// target and adds an HTML body.
 	w.Header().Set("Location", link.URL)
 	w.WriteHeader(http.StatusFound)
+}
+
+func (h *Handler) metadata(w http.ResponseWriter, r *http.Request) {
+	link, err := h.lookup(r.PathValue("code"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, linkResponse{
+		URL:       link.URL,
+		CreatedAt: link.CreatedAt.UTC().Format(time.RFC3339),
+	})
+}
+
+func (h *Handler) lookup(code string) (shortener.Link, error) {
+	if !shortener.IsValidCode(code) {
+		return shortener.Link{}, fmt.Errorf("code %q: %w", code, shortener.ErrNotFound)
+	}
+	return h.store.Get(code)
+}
+
+func writeDomainError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, shortener.ErrInvalidURL):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, shortener.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not found")
+	default:
+		log.Printf("internal error: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

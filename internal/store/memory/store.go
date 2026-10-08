@@ -41,6 +41,7 @@ func New(opts ...Option) *Store {
 	}
 	return s
 }
+
 func (s *Store) Shorten(longURL string) (shortener.Link, error) {
 	if l, ok := s.lookupURL(longURL); ok {
 		return l, nil
@@ -74,11 +75,14 @@ func (s *Store) Shorten(longURL string) (shortener.Link, error) {
 		attemptsPerLength*len(codeLengths), codeLengths)
 }
 
-func (s *Store) Get(code string) (shortener.Link, bool) {
+func (s *Store) Get(code string) (shortener.Link, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	l, ok := s.byCode[code]
-	return l, ok
+	s.mu.RUnlock()
+	if !ok {
+		return shortener.Link{}, fmt.Errorf("get %q: %w", code, shortener.ErrNotFound)
+	}
+	return l, nil
 }
 
 func (s *Store) Len() int {

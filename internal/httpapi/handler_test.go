@@ -19,6 +19,10 @@ func newTestHandler(opts ...memory.Option) *Handler {
 	return New(memory.New(opts...), testBase)
 }
 
+func memStore(h *Handler) *memory.Store {
+	return h.store.(*memory.Store)
+}
+
 func doShorten(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/shorten", strings.NewReader(body))
@@ -125,7 +129,7 @@ func TestShorten_BadRequest(t *testing.T) {
 			if !strings.Contains(e.Error, tt.wantMsg) {
 				t.Errorf("error = %q, want it to contain %q", e.Error, tt.wantMsg)
 			}
-			if h.store.Len() != 0 {
+			if memStore(h).Len() != 0 {
 				t.Error("rejected request must not store a link")
 			}
 		})
@@ -227,8 +231,8 @@ func TestConcurrentShortenSameURLAndRedirect(t *testing.T) {
 			t.Fatalf("request %d got code %q, request 0 got %q", i, c, codes[0])
 		}
 	}
-	if h.store.Len() != 1 {
-		t.Errorf("store has %d links, want 1", h.store.Len())
+	if memStore(h).Len() != 1 {
+		t.Errorf("store has %d links, want 1", memStore(h).Len())
 	}
 }
 

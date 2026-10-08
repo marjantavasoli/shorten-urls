@@ -13,12 +13,15 @@ None. Part 1 uses only the Go standard library (`net/http`, `encoding/json`,
 cmd/server/            main: flags (-addr, -base), validation, wiring, http.Server.
                        Logic lives in run()/parseConfig() so it is testable; main() only calls run().
 internal/shortener/    Domain, no HTTP or storage knowledge: Link type, NormalizeURL,
-                       RandomCode, IsValidCode.
+                       RandomCode, IsValidCode, sentinel errors (Part 2).
 internal/store/memory/ In-memory store: two maps + sync.RWMutex.
-internal/httpapi/      HTTP handlers and routes on net/http's Go 1.22 ServeMux.
+internal/httpapi/      HTTP handlers and routes on net/http's Go 1.22 ServeMux,
+                       plus the Store interface they depend on (Part 2).
 ```
 
-Dependency direction: `cmd/server → httpapi → {shortener, memory}`, `memory → shortener`.
+Dependency direction: `cmd/server → {httpapi, memory}`, `httpapi → shortener`,
+`memory → shortener`. Since Part 2, `httpapi` no longer imports `memory`:
+`cmd/server` is the only place that knows which store is used.
 Nothing imports `httpapi` or `cmd`.
 
 - **Router:** standard `net/http.ServeMux` with method + wildcard patterns
@@ -104,7 +107,7 @@ On a collision, the store retries with a fresh random code, escalating the lengt
 length 6: up to 3 attempts
 length 7: up to 3 attempts   (62⁷ ≈ 3.5 × 10¹²)
 length 8: up to 3 attempts   (62⁸ ≈ 2.2 × 10¹⁴)
-then: error → HTTP 500 "could not create short link"; nothing is stored
+then: error → HTTP 500 {"error":"internal error"}; nothing is stored
 ```
 
 With 10 million links stored, a 6-character attempt collides with
@@ -114,8 +117,9 @@ space ever gets crowded, the length grows instead of failing.
 `TestShorten_LengthEscalation` checks the exact attempt sequence
 `6,6,6,7,7,7,8,8,8` and the final error.
 
-Redirect requests for paths that cannot be a code (not 6–8 base62 chars,
-e.g. `/favicon.ico`) get **404** without touching the store.
+Requests for paths that cannot be a code (not 6–8 base62 chars, e.g.
+`/favicon.ico`) get **404** without touching the store. Since Part 2 this
+applies to both the redirect and the metadata route.
 
 ### Mutex type and which methods lock
 
@@ -148,6 +152,7 @@ Part 3 benchmarks will confirm or revisit this choice.
   data → **400**. `Content-Type` is not enforced, so
   `curl -d '{"url":…}'` without the header also works.
 - **Errors:** responses are JSON `{"error":"<message>"}` with 400/404/500.
+  Part 2 describes how errors are mapped to these.
 - **Redirect:** `Location` is set directly and the handler writes **302**
   with no body. `http.Redirect` is not used because it can rewrite the target
   and adds an HTML body.
@@ -160,3 +165,120 @@ Part 3 benchmarks will confirm or revisit this choice.
 - **`-addr`:** listen address, default `:8080`.
 - **Logging:** if a create fails, the error is logged but **never the long
   URL**, since query strings may contain secrets.
+
+## Part 2
+
+### Sentinel errors
+
+Defined in the domain package, `internal/shortener/errors.go`:
+
+```go
+var (
+	ErrInvalidURL = errors.New("invalid url")
+	ErrNotFound   = errors.New("link not found")
+)
+```
+
+- **Why in `shortener` and not in a store or HTTP package:** every store
+  (memory now, Postgres in Part 4) returns them and `httpapi` checks them.
+  Putting them in the shared domain package means none of those packages
+  has to import another.
+- `NormalizeURL` wraps `ErrInvalidURL` with the specific reason:
+  `fmt.Errorf("%w: url scheme must be http or https", ErrInvalidURL)`.
+  `err.Error()` is then `"invalid url: url scheme must be http or https"`,
+  and `errors.Is(err, ErrInvalidURL)` is true.
+- `memory.Store.Get` returns `fmt.Errorf("get %q: %w", code, ErrNotFound)`
+  for an unknown code.
+- Validation errors come from the domain (`NormalizeURL`), not the store.
+  The handler normalizes before calling the store, so stores never see
+  invalid input.
+
+### `Store` interface: location and methods
+
+Defined in `internal/httpapi/store.go`, the package that uses it:
+
+```go
+type Store interface {
+	Shorten(longURL string) (shortener.Link, error)
+	Get(code string) (shortener.Link, error)
+}
+```
+
+- **Location:** at the consumer, following "accept interfaces, return
+  structs". `memory.Store` satisfies it without importing `httpapi`. The
+  interface lists only the two methods the handlers call (`Len()` stays on
+  `memory.Store` as a test helper). `cmd/server` has a compile-time check,
+  `var _ httpapi.Store = (*memory.Store)(nil)`, and is the only place a
+  concrete store is chosen.
+- **`Shorten(longURL)`** expects an already-normalized URL and returns the
+  existing link or creates one. Same URL → same code: the Part 1
+  idempotency rule is part of the interface contract, not just a property
+  of the memory implementation.
+- **`Get(code)`** changed from `(Link, bool)` in Part 1 to `(Link, error)`.
+  A `bool` can only say "missing". A database-backed store (Part 4) can also
+  fail for other reasons (connection lost, timeout), and those must become
+  500, not 404. "Not found" is now an error wrapping `ErrNotFound`.
+- **No `context.Context` yet.** The memory store does no I/O and has
+  nothing to cancel, so a `ctx` parameter would go unused. It will be added
+  in Part 4, where Postgres queries need cancellation and deadlines
+  (`db.WithContext(ctx)`).
+
+### How errors become status codes and response bodies
+
+All handlers send domain and store errors through one function,
+`writeDomainError`, which checks them with `errors.Is`. It finds the
+sentinel however many times the error has been wrapped with `%w`.
+
+| Error | Status | Body |
+|---|---|---|
+| wraps `ErrInvalidURL` | 400 | `{"error":"invalid url: <reason>"}`: the reason is safe and helps the client fix the request |
+| wraps `ErrNotFound` | 404 | `{"error":"not found"}` |
+| anything else | 500 | `{"error":"internal error"}`: details are logged on the server and never sent to the client |
+
+Request-format errors are found while decoding the body, before any domain
+call, and return 400 directly:
+- malformed JSON or a non-string `url`
+- trailing data after the JSON object
+- a body larger than 8 KiB
+
+Wrong methods get 405 from `ServeMux`.
+
+The 500 body is deliberately generic. A store error may contain hostnames,
+SQL or file paths (Part 4), and the client can't act on any of that.
+
+### Metadata route
+
+`GET /api/v1/links/{code}` → **200** `{"url":"…","created_at":"…"}`, or
+**404** `{"error":"not found"}` for unknown or malformed codes.
+
+- **`created_at` format:** RFC 3339 in UTC with whole seconds, e.g.
+  `2026-01-15T12:00:00Z`, matching the spec's example. The response struct
+  holds a pre-formatted string, `CreatedAt.UTC().Format(time.RFC3339)`.
+  Marshalling a `time.Time` directly would use RFC3339**Nano**
+  (`2026-01-15T12:00:00.123456789Z`) and keep the original time zone
+  offset. The stored value keeps full precision; only the API output is
+  truncated to seconds.
+- The response contains exactly `url` and `created_at`, as specified.
+- It shares the `lookup` helper with the redirect route (code-shape check,
+  then `Store.Get`), so both routes behave the same for unknown and
+  malformed codes.
+- There is no route conflict with `GET /{code}`, because the two patterns
+  have different numbers of path segments.
+
+### Tests
+
+- **`fakeStore`** (`internal/httpapi/fake_store_test.go`) has injectable
+  `ShortenFn`/`GetFn` and records its arguments. It is used to check:
+  - error mapping for `ErrNotFound` → 404, an unknown error → 500 with no
+    details leaked, and a doubly-wrapped `ErrNotFound` → 404;
+  - that the handler passes the **normalized** URL to the store;
+  - that the store is **never called** for invalid URLs or malformed codes;
+  - the redirect and metadata responses produced from a stored link.
+- **Metadata route against the real memory store:** a fixed clock in a
+  non-UTC zone with nanoseconds checks the exact JSON (`created_at` in UTC,
+  no fraction, exactly two keys), that no `Location` header is set, and the
+  404 cases.
+- **Idempotency after the refactor:** the Part 1 HTTP tests
+  (`TestShorten_Idempotent`, `TestConcurrentShortenSameURLAndRedirect`) now
+  run through the `Store` interface, because `httpapi.New` takes a `Store`.
+  The memory store's idempotency and concurrency tests are unchanged.

@@ -1,7 +1,6 @@
 package shortener
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -13,23 +12,23 @@ const MaxURLLength = 2048
 func NormalizeURL(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return "", errors.New("url is required")
+		return "", fmt.Errorf("%w: url is required", ErrInvalidURL)
 	}
 	if len(s) > MaxURLLength {
-		return "", fmt.Errorf("url is longer than %d bytes", MaxURLLength)
+		return "", fmt.Errorf("%w: url is longer than %d bytes", ErrInvalidURL, MaxURLLength)
 	}
 
 	u, err := url.Parse(s)
 	if err != nil {
-		return "", errors.New("url is malformed")
+		return "", fmt.Errorf("%w: url is malformed", ErrInvalidURL)
 	}
 
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return "", errors.New("url scheme must be http or https")
+		return "", fmt.Errorf("%w: url scheme must be http or https", ErrInvalidURL)
 	}
 	if u.Opaque != "" || u.Hostname() == "" {
-		return "", errors.New("url must be absolute and include a host")
+		return "", fmt.Errorf("%w: url must be absolute and include a host", ErrInvalidURL)
 	}
 
 	host := strings.ToLower(u.Hostname())

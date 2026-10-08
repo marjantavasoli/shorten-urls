@@ -29,9 +29,9 @@ func TestShorten_NewURL(t *testing.T) {
 		t.Errorf("CreatedAt = %v, want %v in UTC", l.CreatedAt, fixed)
 	}
 
-	got, ok := s.Get(l.Code)
-	if !ok || got != l {
-		t.Errorf("Get(%q) = %+v, %v; want %+v, true", l.Code, got, ok, l)
+	got, err := s.Get(l.Code)
+	if err != nil || got != l {
+		t.Errorf("Get(%q) = %+v, %v; want %+v, nil", l.Code, got, err, l)
 	}
 }
 
@@ -57,8 +57,12 @@ func TestShorten_DistinctURLsDistinctCodes(t *testing.T) {
 }
 
 func TestGet_Unknown(t *testing.T) {
-	if _, ok := New().Get("zzzzzz"); ok {
-		t.Error("Get on empty store returned ok")
+	_, err := New().Get("zzzzzz")
+	if !errors.Is(err, shortener.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "zzzzzz") {
+		t.Errorf("err = %q, want it to mention the code", err)
 	}
 }
 
@@ -188,8 +192,8 @@ func TestShorten_ConcurrentDistinctURLsAndReads(t *testing.T) {
 			}
 			seen[l.Code] = u
 			mu.Unlock()
-			if got, ok := s.Get(l.Code); !ok || got.URL != u {
-				t.Errorf("Get(%q) = %+v, %v", l.Code, got, ok)
+			if got, err := s.Get(l.Code); err != nil || got.URL != u {
+				t.Errorf("Get(%q) = %+v, %v", l.Code, got, err)
 			}
 		}()
 		go func() {

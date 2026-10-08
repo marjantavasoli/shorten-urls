@@ -25,8 +25,10 @@ Links are kept in memory (Part 1) and are lost on restart.
 |---|---|---|---|
 | `POST` | `/api/shorten` | **201** `{"code","short_url"}`. The same URL always returns the same code | **400** missing, empty or invalid `url` (only `http`/`https`), bad JSON |
 | `GET` / `HEAD` | `/{code}` | **302** with `Location: <long url>` | **404** unknown code |
+| `GET` | `/api/v1/links/{code}` | **200** `{"url","created_at"}` (RFC 3339, UTC), no redirect | **404** unknown code |
 
-Error bodies are JSON: `{"error":"..."}`.
+Error bodies are JSON: `{"error":"..."}`. Any unexpected server-side failure
+returns **500** `{"error":"internal error"}`; the details are only logged.
 
 ### Example
 
@@ -51,7 +53,27 @@ curl -s -X POST localhost:8080/api/shorten -d '{"url":"ftp://x.com"}'
 
 curl -s localhost:8080/zzzzzz
 # {"error":"not found"}   (404)
+
+# Metadata without redirecting
+curl -s localhost:8080/api/v1/links/WoWswQ
+# {"url":"https://go.dev/doc/","created_at":"2026-10-08T16:11:49Z"}
+
+curl -s localhost:8080/api/v1/links/zzzzzz
+# {"error":"not found"}   (404)
 ```
+
+### Idempotency after the Part 2 refactor
+
+Since Part 2, the handlers depend on the `httpapi.Store` interface instead
+of the concrete memory store. Same URL → same code still holds, and these
+tests check it through the interface:
+
+- `internal/httpapi`: `TestShorten_Idempotent` (sequential, including
+  normalized-equivalent URLs) and `TestConcurrentShortenSameURLAndRedirect`
+  (100 concurrent requests for one URL → one code) run over HTTP against the
+  memory store passed in as a `Store`.
+- `internal/store/memory`: `TestShorten_SameURLSameCode` and
+  `TestShorten_ConcurrentSameURL` (200 goroutines).
 
 ## Test
 
@@ -67,5 +89,5 @@ go tool cover -func=coverage.out | tail -n1
 Current coverage:
 
 ```text
-total:							(statements)	95.5%
+total:							(statements)	97.6%
 ```

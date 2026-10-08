@@ -1,6 +1,7 @@
 package shortener
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -76,8 +77,9 @@ func TestNormalizeURL_Invalid(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, err := NormalizeURL(tt.in); err == nil {
-				t.Errorf("NormalizeURL(%q) = %q, want error", tt.in, got)
+			got, err := NormalizeURL(tt.in)
+			if !errors.Is(err, ErrInvalidURL) {
+				t.Errorf("NormalizeURL(%q) = %q, %v; want ErrInvalidURL", tt.in, got, err)
 			}
 		})
 	}

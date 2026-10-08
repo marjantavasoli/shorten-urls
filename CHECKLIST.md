@@ -16,14 +16,14 @@
 
 ## Part 2 — API & errors (25 points)
 
-| Done | Pts | Requirement |
-|:----:|:---:|-------------|
-| [ ] | 5 | Metadata route **200** / **404** with correct JSON |
-| [ ] | 4 | `ErrNotFound`, `ErrInvalidURL` from store/domain |
-| [ ] | 4 | `%w` + `errors.Is` in HTTP mapping |
-| [ ] | 5 | `Store` interface + fake used in tests |
-| [ ] | 4 | Tests for metadata route and error mapping |
-| [ ] | 3 | Test or note in README: idempotency still works via `Store` / HTTP after Part 2 changes |
+| Done | Pts | Requirement | Where |
+|:----:|:---:|-------------|-------|
+| [x] | 5 | Metadata route **200** / **404** with correct JSON | `httpapi.TestMetadata_OK`, `TestMetadata_NotFound`, `TestRedirectAndMetadata_WithFake` |
+| [x] | 4 | `ErrNotFound`, `ErrInvalidURL` from store/domain | `internal/shortener/errors.go`; `shortener.TestNormalizeURL_Invalid`, `memory.TestGet_Unknown` |
+| [x] | 4 | `%w` + `errors.Is` in HTTP mapping | `httpapi.writeDomainError`; `httpapi.TestWriteDomainError` (incl. doubly-wrapped) |
+| [x] | 5 | `Store` interface + fake used in tests | `internal/httpapi/store.go`, `internal/httpapi/fake_store_test.go` |
+| [x] | 4 | Tests for metadata route and error mapping | `internal/httpapi/metadata_test.go`, `internal/httpapi/errors_test.go` |
+| [x] | 3 | Test or note in README: idempotency still works via `Store` / HTTP after Part 2 changes | README "Idempotency after the Part 2 refactor"; `httpapi.TestShorten_Idempotent`, `TestConcurrentShortenSameURLAndRedirect` |
 
 ## Part 3 — Performance & measurement (25 points)
 
